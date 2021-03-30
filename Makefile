@@ -5,8 +5,8 @@ LDFLAGS =
 bins = s5
 objs = $(bins:=.o)
 
-cmd_cc_o_c = $(CC) $(CFLAGS) -c -o $@ $<
-quiet_cmd_cc_o_c = CC      $@
+# cmd_cc_o_c = $(CC) $(CFLAGS) -c -o $@ $<
+# quiet_cmd_cc_o_c = CC      $@
 
 ifneq ($(V),1)
 	V=0
@@ -29,8 +29,10 @@ $(bins) : % : %.o
 
 $(objs) : %.o : %.c
 	$(V_CC)$(CC) $(CFLAGS) -c -o $@ $<
+	@$(CC) -MM $(CFLAGS) $*.c > $*.d
 
 .PHONY: clean
 
 clean:
 	$(RM) $(bins) $(objs)
+	$(RM) *.d
