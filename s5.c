@@ -79,6 +79,8 @@ struct source {
 	void (*func)(struct source *s, int events);
 	struct loop *loop;
 
+	unsigned active:1;
+
 	struct timer timer;
 };
 
@@ -92,11 +94,10 @@ struct loop {
 	struct list_head timer_list;
 };
 
-struct source_data {
-	union {
-		unsigned long status;
-		struct source *peer;
-	};
+struct stream_info {
+	unsigned long status;
+
+	struct source *source;
 
 	struct sockaddr_in local;
 	struct sockaddr_in remote;
@@ -105,6 +106,10 @@ struct source_data {
 	char remote_name[24];
 
 	char *host;
+};
+
+struct stream_chain {
+	struct stream_info arr[2];
 };
 
 void source_add_timer(struct source *s, unsigned long usec, void (*func)(struct source *s))
@@ -218,6 +223,9 @@ again:
 		struct source *s = loop->event_list[i].data.ptr;
 		int events = loop->event_list[i].events;
 
+		if (!s->active)
+			continue;
+
 		if (events & (EPOLLERR| EPOLLHUP)) {
 			if (!(events & (EPOLLIN|EPOLLOUT)))
 				events |= (EPOLLIN|EPOLLOUT);
@@ -253,6 +261,7 @@ void loop_del_source(struct source *s, int ctldel)
 
 	s->data = loop->free_source;
 	loop->free_source = s;
+	s->active = 0;
 
 	if (ctldel) {
 		ee.events = 0;
@@ -263,7 +272,8 @@ void loop_del_source(struct source *s, int ctldel)
 	}
 }
 
-struct source *loop_get_source(struct loop *loop, int fd, int events)
+struct source *loop_get_source(struct loop *loop, int fd, int events,
+		void (*func)(struct source *, int), void *data)
 {
 	struct source *s;
 	struct epoll_event ee;
@@ -274,9 +284,6 @@ struct source *loop_get_source(struct loop *loop, int fd, int events)
 	loop->free_source = s->data;
 
 	memset(s, 0, sizeof(*s));
-	s->fd = fd;
-	s->events = events;
-	s->loop = loop;
 
 	ee.events = events;
 	ee.data.ptr = s;
@@ -285,6 +292,13 @@ struct source *loop_get_source(struct loop *loop, int fd, int events)
 		loop_del_source(s, 0);
 		return NULL;
 	}
+
+	s->fd = fd;
+	s->active = 1;
+	s->events = events;
+	s->loop = loop;
+	s->func = func;
+	s->data = data;
 
 	return s;
 }
@@ -400,7 +414,7 @@ int connect_host(const char *host, const char *service)
 	}
 
 	for (rp = result; rp != NULL; rp = rp->ai_next) {
-		struct timeval tv = { 0, 100000 };
+		struct timeval tv = { 0, 200000 };
 		socklen_t slen = sizeof(tv);
 
 		fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
@@ -423,19 +437,40 @@ int connect_host(const char *host, const char *service)
 	return fd;
 }
 
-void source_close(struct source *s)
+void source_close(struct source *s, void (*destroy)(void *data))
 {
-	printf("%s %d\n", __FUNCTION__, __LINE__);
-	if (s->data) {
-		free(s->data);
+	if (!s)
+		return;
+
+	if (s->data && destroy) {
+		destroy(s->data);
 		s->data = NULL;
 	}
-	loop_del_source(s, 1);
-	close(s->fd);
+	if (s->fd > 0) {
+		loop_del_source(s, 1);
+		close(s->fd);
+	}
 	s->fd = -1;
 }
 
-void get_sockname_info(struct source_data *data, int fd)
+void close_stream_chain(struct stream_chain *chain)
+{
+	int i;
+	struct stream_info *si = &chain->arr[0];
+	struct stream_info *di = &chain->arr[1];
+
+	printf("%s %d sources (%p, %p)\n", __FUNCTION__, __LINE__, si->source, di->source);
+
+	for (i = 0; i < 2; i++) {
+		if (chain->arr[i].host)
+			free(chain->arr[i].host);
+		source_close(chain->arr[i].source, NULL);
+	}
+
+	free(chain);
+}
+
+void get_sockname_info(struct stream_info *data, int fd)
 {
 	socklen_t slen;
 
@@ -460,13 +495,15 @@ void get_sockname_info(struct source_data *data, int fd)
 
 void handle_socks5_req(struct source *s, uint8_t *buf, size_t ret)
 {
+	struct stream_chain *chain = s->data;
+
 	if (buf[0] != 5) {
-		source_close(s);
+		close_stream_chain(chain);
 	} else if (ret != 2 + buf[1]) {
-		source_close(s);
+		close_stream_chain(chain);
 	} else {
 		int i;
-		struct source_data *data = s->data;
+		struct stream_info *si = &chain->arr[0];
 		uint8_t res[2] = { 0x05, 0x00 };
 
 		for (i = 0; i < buf[1]; i++) {
@@ -475,75 +512,72 @@ void handle_socks5_req(struct source *s, uint8_t *buf, size_t ret)
 		}
 
 		if (i == buf[1]) {
-			source_close(s);
+			close_stream_chain(chain);
 			return;
 		}
 
-		data->status = SOCKS5_CONNECT;
-		if (write(s->fd, res, sizeof(res)) != sizeof(res))
-			source_close(s);
+		si->status = SOCKS5_CONNECT;
+		i = write(s->fd, res, sizeof(res));
+		if (i != sizeof(res)) {
+			if (i < 0) {
+				perror("write");
+			}
+			close_stream_chain(chain);
+		}
 	}
 }
 
 void handle_remote(struct source *s, int events)
 {
 	char buf[16384];
-	struct source_data *data = s->data;
-	ssize_t ret;
+	struct stream_chain *chain = s->data;
+	struct stream_info *si = &chain->arr[1];
+	struct stream_info *di = &chain->arr[0];
+	struct source *peer = chain->arr[0].source;
+	ssize_t ret, r;
 
-	ret = read(s->fd, buf, sizeof(buf));
-	if (ret <= 0) {
-		if (ret == -1)
+	r = read(s->fd, buf, sizeof(buf));
+	if (r <= 0) {
+		if (r == -1)
 			perror("read");
 
-		if (data->peer) {
-			struct source_data *peer_data = data->peer->data;
-			peer_data->peer = NULL;
-		}
-
-		source_close(s);
+		close_stream_chain(chain);
 		return;
 	}
 
-	printf("%s -> %s %zd bytes\n", data->host, data->local_name, ret);
-	if (data->peer) {
-		struct source_data *peer_data = data->peer->data;
-		ret = write(data->peer->fd, buf, ret);
-		printf("%s -> %s %zd bytes\n", peer_data->local_name, peer_data->remote_name, ret);
-		if (ret < 0) {
+	ret = write(peer->fd, buf, r);
+	printf("%s -> %s %zd:%zd bytes\n", si->host, di->remote_name, r, ret);
+	if (ret <= 0) {
+		if (ret < 0)
 			perror("write");
-		}
-	}
 
-	if (!data->peer || ret <= 0) {
-		if (data->peer) {
-			data = data->peer->data;
-			data->peer = NULL;
-		}
-		source_close(s);
+		close_stream_chain(chain);
 	}
 }
 
 void handle_socks5_connect(struct source *s, uint8_t *buf, size_t ret)
 {
+	struct stream_chain *chain = s->data;
+
 	if (buf[0] != 5 || buf[1] != 0x1) {
-		source_close(s);
+		close_stream_chain(chain);
 	} else if (buf[3] != 3) {
-		source_close(s);
+		close_stream_chain(chain);
 	} else {
 		int len = buf[4];
 		int total = 4 + 1 + len + 2;
-		struct source_data *data;
+		struct stream_info *si = &chain->arr[0];
+		struct stream_info *di = &chain->arr[1];
 		struct source *c;
 		int fd;
 		uint16_t port;
 		char service[16];
 		char *host = (char *)&buf[5];
-		struct source_data *sdata = s->data;
 		uint8_t res[] = { 0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 
 		if (total != ret) {
-			source_close(s);
+			fprintf(stderr, "received an unexpected packet\n");
+			close_stream_chain(chain);
 			return;
 		}
 
@@ -554,60 +588,51 @@ void handle_socks5_connect(struct source *s, uint8_t *buf, size_t ret)
 		fd = connect_host(host, service);
 		if (fd == -1) {
 			fprintf(stderr, "failed to connect %s:%s\n", host, service);
-			source_close(s);
+			close_stream_chain(chain);
 			return;
 		}
 
-		c = loop_get_source(s->loop, fd, EPOLLIN);
+		c = loop_get_source(s->loop, fd, EPOLLIN, handle_remote, s->data);
 		if (!c) {
 			fprintf(stderr, "failed to get source for %s:%s\n", host, service);
-			source_close(s);
+			close(fd);
+			close_stream_chain(chain);
 			return;
 		}
 
-		data = malloc(sizeof(struct source_data));
-		if (!data) {
-			source_close(c);
-			source_close(s);
-			return;
+		di->source = c;
+		get_sockname_info(di, fd);
+
+		di->host = calloc(1, buf[4] + strlen(service) + 2);
+		if (di->host) {
+			sprintf(di->host, "%s:%s", host, service);
 		}
 
-		data->peer = s;
+		printf("%s <- %s <- %s <- %s\n", di->host, di->local_name, si->local_name, si->remote_name);
 
-		get_sockname_info(data, fd);
-
-		data->host = calloc(1, buf[4] + strlen(service) + 2);
-		if (data->host) {
-			sprintf(data->host, "%s:%s", host, service);
+		if (write(s->fd, res, sizeof(res)) < 0) {
+			perror("error");
+			close_stream_chain(chain);
 		}
 
-		c->func = handle_remote;
-		c->data = data;
-		sdata->peer = c;
-		printf("%s <- %s\n", data->host, data->local_name);
-
-		write(s->fd, res, sizeof(res));
+		si->status = SOCKS5_CONNECT + 1;
 	}
 }
 
 void handle_socks5_data(struct source *s, uint8_t *buf, size_t ret)
 {
-	struct source_data *data = s->data;
-	struct source *peer = data->peer;
+	struct stream_chain *chain = s->data;
+	struct source *peer = chain->arr[1].source;
+	struct stream_info *si = &chain->arr[0];
+	struct stream_info *di = &chain->arr[1];
 	ssize_t r = -1;
 
-	if (peer) {
-		r = write(peer->fd, buf, ret);
-		printf("%s <- %s %zd bytes\n", data->local_name, data->remote_name, r);
-	}
-
+	r = write(peer->fd, buf, ret);
+	printf("%s <- %s %zd bytes\n", di->host, si->remote_name, r);
 	if (r <= 0) {
-		printf("close..\n");
-		if (peer) {
-			data = peer->data;
-			data->peer = NULL;
-		}
-		source_close(s);
+		if (r < 0)
+			perror("write");
+		close_stream_chain(chain);
 	}
 }
 
@@ -615,7 +640,8 @@ void handle_request(struct source *s, int events)
 {
 	uint8_t buf[512];
 	ssize_t ret;
-	struct source_data *data = s->data;
+	struct stream_chain *chain = s->data;
+	struct stream_info *si = &chain->arr[0];
 
 	ret = read(s->fd, buf, sizeof(buf));
 	if (ret <= 0) {
@@ -623,18 +649,13 @@ void handle_request(struct source *s, int events)
 			perror("read");
 		}
 
-		if (data->status > SOCKS5_CONNECT) {
-			struct source_data *peer_data = data->peer->data;
-			peer_data->peer = NULL;
-		}
-
-		source_close(s);
+		close_stream_chain(chain);
 		return;
  	}
 
-	if (data->status == SOCKS5_REQ) {
+	if (si->status == SOCKS5_REQ) {
 		handle_socks5_req(s, buf, ret);
-	} else if (data->status == SOCKS5_CONNECT) {
+	} else if (si->status == SOCKS5_CONNECT) {
 		handle_socks5_connect(s, buf, ret);
 	} else {
 		handle_socks5_data(s, buf, ret);
@@ -647,34 +668,35 @@ void server_do_accept(struct source *s, int events)
 	struct sockaddr_in sin;
 	socklen_t socklen = sizeof(sin);
 	struct source *c;
-	struct source_data *data;
+	struct stream_info *si;
+	struct stream_chain *chain;
 
 	fd = accept(s->fd, (struct sockaddr *)&sin, &socklen);
 	if (fd == -1) {
-		loop_del_source(s, 1);
-		close(s->fd);
+		perror("accept");
+		source_close(s, NULL);
 		return;
 	}
 
-	c = loop_get_source(s->loop, fd, EPOLLIN);
+	chain = calloc(1, sizeof(*chain));
+	if (chain == NULL) {
+		close(fd);
+		return;
+	}
+
+	c = loop_get_source(s->loop, fd, EPOLLIN, handle_request, chain);
 	if (!c) {
 		printf("Too many connection!\n");
+		free(chain);
 		close(fd);
 		return;
 	}
 
-	c->func = handle_request;
-	data = calloc(1, sizeof(struct source_data));
-	if (!data) {
-		close(fd);
-		loop_del_source(s, 0);
-		return;
-	}
-	c->data = data;
+	si = &chain->arr[0];
+	si->source = c;
+	get_sockname_info(si, fd);
 
-	get_sockname_info(data, fd);
-
-	printf("%s <- %s\n", data->local_name, data->remote_name);
+	printf("%s <- %s\n", si->local_name, si->remote_name);
 }
 
 int main(int argc, char *argv[])
@@ -696,9 +718,11 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 
-	s = loop_get_source(loop, fd, EPOLLIN);
-	s->func = server_do_accept;
-	s->data = NULL;
+	s = loop_get_source(loop, fd, EPOLLIN, server_do_accept, NULL);
+	if (s == NULL) {
+		loop_destroy(loop);
+		exit(2);
+	}
 
 	for (;;) {
 		ret = loop_process_events_timers(loop, -1);
@@ -708,10 +732,8 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	loop_del_source(s, 0);
-	close(fd);
-
+	source_close(s, NULL);
 	loop_destroy(loop);
 
-	return ret < 0 ? 1 : 0;
+	return ret < 0 ? 3 : 0;
 }
