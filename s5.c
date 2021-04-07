@@ -414,7 +414,7 @@ int connect_host(const char *host, const char *service)
 	}
 
 	for (rp = result; rp != NULL; rp = rp->ai_next) {
-		struct timeval tv = { 0, 200000 };
+		struct timeval tv = { 0, 500000 };
 		socklen_t slen = sizeof(tv);
 
 		fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
@@ -613,6 +613,7 @@ void handle_socks5_connect(struct source *s, uint8_t *buf, size_t ret)
 		if (write(s->fd, res, sizeof(res)) < 0) {
 			perror("error");
 			close_stream_chain(chain);
+			return;
 		}
 
 		si->status = SOCKS5_CONNECT + 1;
