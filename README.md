@@ -10,8 +10,8 @@ With Nginx stream forwarding, this proxy can run on a remote server and receive 
 
 ### local
 
-ngxsl.conf is the config file for local Nginx.
+ngxsl.conf is the config file for the local Nginx.
 
 ### remote server
 
-ngxss.conf is the config file is the remote Nginx, which requires the certificate and key named by cert.pem and key.pem for SSL.
+ngxss.conf is the config file for the remote Nginx, which requires the certificate and key named by cert.pem and key.pem for SSL.
